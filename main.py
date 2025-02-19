@@ -93,10 +93,18 @@ def parse_args():
     VERBOSE = ARGS.verbose
     FILE_PATH = ARGS.output
     if ARGS.date is not None:
-        if len(ARGS.date.split("@")) > 1:
-            LIMIT_DATE = datetime.strptime(ARGS.date, "%d/%m/%Y@%H:%M:%S")
-        else:
-            LIMIT_DATE = datetime.strptime(ARGS.date, "%d/%m/%Y")
+        try:
+            if len(ARGS.date.split("@")) > 1:
+                LIMIT_DATE = datetime.strptime(ARGS.date, "%d/%m/%Y@%H:%M:%S")
+            else:
+                LIMIT_DATE = datetime.strptime(ARGS.date, "%d/%m/%Y")
+            
+            # Check if date is in the future
+            if LIMIT_DATE > datetime.now():
+                return (False, "Limit date cannot be in the future")
+                
+        except ValueError:
+            return (False, "Invalid date format. Use dd/mm/yyyy or dd/mm/yyyy@HH:MM:SS")
     return (True, None)
 
 
@@ -104,16 +112,38 @@ def get_request(url: str, headers: dict, cookies: dict):
     r = requests.get(url, headers=headers, cookies=cookies)
     global REQUESTS_AMMOUNT
     REQUESTS_AMMOUNT += 1
-    if r.status_code != 200 and r.status_code == 429:
-        rate_limit()
+    
     try:
         res = r.json()
+        if 'status' in res and res['status'] == 'fail':
+            if res.get('message') == 'login_required':
+                # Check if the thread ID exists in the list of valid threads
+                thread_id = url.split('threads/')[1].split('?')[0] if 'threads/' in url else None
+                if thread_id:
+                    print(colored(f"Error: Cannot access thread {thread_id}. This could mean:", "red"))
+                    print(colored("1. The thread no longer exists", "yellow"))
+                    print(colored("2. You don't have permission to access this thread", "yellow"))
+                    print(colored("3. Your session needs to be refreshed", "yellow"))
+                else:
+                    print(colored("Error: Session ID is invalid or expired. Please provide a valid session ID.", "red"))
+                force_exit()
+                sys.exit(1)
+            else:
+                print(colored(f"Error: {res.get('message', 'Unknown error')}", "red"))
+                force_exit()
+                sys.exit(1)
+            
         global LAST_RESPONSE
         LAST_RESPONSE = res
         return res
     except json.JSONDecodeError:
-        print(r.text)
-        return None
+        print(colored(f"Error: Invalid response from Instagram API: {r.text}", "red"))
+        force_exit()
+        sys.exit(1)
+    except Exception as e:
+        print(colored(f"Error making request: {str(e)}", "red"))
+        force_exit()
+        sys.exit(1)
 
 def reverse_list(target_list):
     """
@@ -220,6 +250,28 @@ def start():
     global MESSAGES
     global TOTAL_TIME
     resposta = get_request(f"https://i.instagram.com/api/v1/direct_v2/threads/{THREADID}/?cursor=", headers, {"sessionid": SESSIONID})
+    
+    if not resposta:
+        print(colored("Error: No response from Instagram API", "red"))
+        force_exit()
+        return
+        
+    if 'status' in resposta and resposta['status'] == 'fail':
+        print(colored(f"Error: {resposta.get('message', 'Unknown error')}", "red"))
+        force_exit()
+        return
+        
+    if 'thread' not in resposta:
+        print(colored("Error: Invalid thread data. This could mean:", "red"))
+        print(colored("1. Your session ID has expired", "yellow"))
+        print(colored("2. The thread ID is incorrect", "yellow"))
+        print(colored("3. You don't have access to this thread", "yellow"))
+        if VERBOSE:
+            print(colored("Response data:", "yellow"))
+            print(resposta)
+        force_exit()
+        return
+        
     thread = resposta["thread"]
     for user in thread["users"]:
         MEMBERS[user["pk"]] = user["full_name"].split(" ")[0]
@@ -231,8 +283,28 @@ def start_streaming():
     global TO_STREAM
     global STREAMED_MESSAGES
     global MEMBERS
+    
     # Get members list
     resposta = get_request(f"https://i.instagram.com/api/v1/direct_v2/threads/{THREADID}/?cursor=", headers, {"sessionid": SESSIONID})
+    
+    if not resposta:
+        print(colored("Error: No response from Instagram API", "red"))
+        return
+        
+    if 'status' in resposta and resposta['status'] == 'fail':
+        print(colored(f"Error: {resposta.get('message', 'Unknown error')}", "red"))
+        return
+        
+    if 'thread' not in resposta:
+        print(colored("Error: Invalid thread data. This could mean:", "red"))
+        print(colored("1. Your session ID has expired", "yellow"))
+        print(colored("2. The thread ID is incorrect", "yellow"))
+        print(colored("3. You don't have access to this thread", "yellow"))
+        if VERBOSE:
+            print(colored("Response data:", "yellow"))
+            print(resposta)
+        return
+        
     thread = resposta["thread"]
     for user in thread["users"]:
         MEMBERS[user["pk"]] = user["full_name"].split(" ")[0]
@@ -257,17 +329,31 @@ def get_threads():
     Get a list of all chats the user from entered sessionid has
     """
     r = get_request("https://i.instagram.com/api/v1/direct_v2/inbox/?persistentBadging=true&folder=&thread_message_limit=1&limit=200", headers, {"sessionid": SESSIONID})
+    if not r or 'inbox' not in r or 'threads' not in r['inbox']:
+        print(colored("Error: Could not fetch threads. Please verify your session ID.", "red"))
+        return
+        
     threads = r["inbox"]["threads"]
-    threads_dict: dict = dict()
+    threads_dict = dict()
     for thread in threads:
-        if thread["is_group"]:
-            name: str = thread['thread_title']
-        else:
-            name: str = thread["users"][0]["full_name"]
-        id = thread["thread_id"]
-        threads_dict[id] = name
+        try:
+            if thread.get("is_group"):
+                name = thread.get('thread_title', 'Unnamed Group')
+            else:
+                users = thread.get("users", [])
+                if users and len(users) > 0 and "full_name" in users[0]:
+                    name = users[0]["full_name"]
+                else:
+                    name = "Unknown User"
+            
+            id = thread["thread_id"]
+            threads_dict[id] = name
+        except Exception as e:
+            print(colored(f"Warning: Could not process thread {thread.get('thread_id', 'unknown')}: {str(e)}", "yellow"))
+            continue
+            
     for thread in threads_dict:
-        print(f"{threads_dict.get(thread)} [{thread}]")
+        print("{} [{}]".format(threads_dict.get(thread), thread))
 
 
 def print_messages(streaming: bool = False):
@@ -424,7 +510,6 @@ def main():
                     traceback.print_exc()
                     force_exit()
     else:
-        # signal.signal(signal.SIGINT, signal_handler)
         SESSIONID = input("Account's Sessionid: ")
         check_threads = input("See chats list (y/N): ")
         if check_threads == "y":
@@ -433,7 +518,7 @@ def main():
         THREADID = input("Chat's Threadid: ")
         choice = input("(1) Dump chat log\n(2) Stream chat\n")
         if choice == "1":
-            streaming = True
+            streaming = False
             enable_verbose = input("Verbose (y/N): ")
             if enable_verbose == "y":
                 VERBOSE = True
@@ -446,10 +531,20 @@ def main():
 
             temp_limit_date = input("Limite date (dd/mm/aa[@hh:mm:ss]): ")
             if temp_limit_date != "":
-                if len(temp_limit_date.split("@")) > 1:
-                    LIMIT_DATE = datetime.strptime(temp_limit_date, "%d/%m/%Y@%H:%M:%S")
-                else:
-                    LIMIT_DATE = datetime.strptime(temp_limit_date, "%d/%m/%Y")
+                try:
+                    if len(temp_limit_date.split("@")) > 1:
+                        LIMIT_DATE = datetime.strptime(temp_limit_date, "%d/%m/%Y@%H:%M:%S")
+                    else:
+                        LIMIT_DATE = datetime.strptime(temp_limit_date, "%d/%m/%Y")
+                        
+                    # Check if date is in the future
+                    if LIMIT_DATE > datetime.now():
+                        print(colored("Error: Limit date cannot be in the future", "red"))
+                        return
+                        
+                except ValueError:
+                    print(colored("Error: Invalid date format. Use dd/mm/yyyy or dd/mm/yyyy@HH:MM:SS", "red"))
+                    return
             if VERBOSE:
                 print("Fetching messages...")
                 print("----------- Verbose -----------")
@@ -461,26 +556,28 @@ def main():
             except Exception as e:
                 traceback.print_exc()
                 force_exit()
-
-        else:
+        elif choice == "2":
             try:
+                streaming = True
                 start_streaming()
             except KeyboardInterrupt:
                 print(f"Streaming terminated!")
+            return  # Exit without showing completion message for streaming mode
 
     if not streaming:
         hours = int(((TOTAL_TIME/1000) / (60 * 60)) % 24)
         minutes = int(((TOTAL_TIME/1000) / 60) % 60)
         seconds = int((TOTAL_TIME/1000) % 60)
-        if hours == 0 and minutes == 0:
-            print(
-                f"Fetching ended! A total of {len(MESSAGES)} messages were fetched in {seconds} {'seconds' if seconds != 1 else 'second'} with {REQUESTS_AMMOUNT} requests to the API and average of {'{:.2f}'.format(compute_average_rate())} messages/second")
-        elif hours == 0 and minutes != 0:
-            print(
-                f"Fetching ended! A total of {len(MESSAGES)} messages were fetched in {minutes} {'minutes' if minutes != 1 else 'minute'}, {seconds} {'seconds' if seconds != 1 else 'second'} with {REQUESTS_AMMOUNT} requests to the API and average of {'{:.2f}'.format(compute_average_rate())} messages/second")
-        else:
-            print(
-                f"Fetching ended! A total of {len(MESSAGES)} messages were fetched in {hours} {'hours' if hours != 1 else 'hour'}, {minutes} {'minutes' if minutes != 1 else 'minute'}, {seconds} {'seconds' if seconds != 1 else 'second'} with {REQUESTS_AMMOUNT} requests to the API and average of {'{:.2f}'.format(compute_average_rate())} messages/second")
+        if len(MESSAGES) > 0:  # Only show completion message if messages were actually fetched
+            if hours == 0 and minutes == 0:
+                print(
+                    f"Fetching ended! A total of {len(MESSAGES)} messages were fetched in {seconds} {'seconds' if seconds != 1 else 'second'} with {REQUESTS_AMMOUNT} requests to the API and average of {'{:.2f}'.format(compute_average_rate())} messages/second")
+            elif hours == 0 and minutes != 0:
+                print(
+                    f"Fetching ended! A total of {len(MESSAGES)} messages were fetched in {minutes} {'minutes' if minutes != 1 else 'minute'}, {seconds} {'seconds' if seconds != 1 else 'second'} with {REQUESTS_AMMOUNT} requests to the API and average of {'{:.2f}'.format(compute_average_rate())} messages/second")
+            else:
+                print(
+                    f"Fetching ended! A total of {len(MESSAGES)} messages were fetched in {hours} {'hours' if hours != 1 else 'hour'}, {minutes} {'minutes' if minutes != 1 else 'minute'}, {seconds} {'seconds' if seconds != 1 else 'second'} with {REQUESTS_AMMOUNT} requests to the API and average of {'{:.2f}'.format(compute_average_rate())} messages/second")
 
 
 if __name__ == '__main__':
